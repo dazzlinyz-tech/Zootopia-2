@@ -6,8 +6,50 @@ export interface StoredRecording {
   durationMs: number;
 }
 
-// Session-persistent recording store so recordings survive screen switches & sentence navigation
+// Session-persistent recording store so completed recordings survive screen switches & sentence navigation
 const recordingStore = new Map<number, StoredRecording>();
+
+interface ActiveRecordingSession {
+  recorder: MediaRecorder;
+  stream: MediaStream;
+  chunks: Blob[];
+  startedAtMs: number;
+  tickerId: number | null;
+  saveSentenceId: number | null;
+  onStopResolvers: Array<(rec: StoredRecording | null) => void>;
+}
+
+// Module-level active recording controller:
+// Ensures MediaRecorder NEVER stops automatically on sentence change, video pause, segment end, loop end, or screen unmount.
+// Recording ONLY stops when the user explicitly triggers stopRecording() (Stop Recording button).
+let activeSession: ActiveRecordingSession | null = null;
+let isStartingRecording = false;
+let globalIsRecording = false;
+let globalElapsedMs = 0;
+let globalError: string | null = null;
+let globalMicDenied = false;
+
+type SessionListener = () => void;
+const listeners = new Set<SessionListener>();
+let latestOnRecordingSaved: ((savedSentenceId: number, recording: StoredRecording) => void) | undefined;
+let latestActiveSentenceId = 1;
+
+function notifyListeners() {
+  listeners.forEach((fn) => fn());
+}
+
+function stopSessionTicker(session: ActiveRecordingSession | null) {
+  if (session && session.tickerId !== null) {
+    window.clearInterval(session.tickerId);
+    session.tickerId = null;
+  }
+}
+
+function releaseSessionStream(stream: MediaStream | null) {
+  if (stream) {
+    stream.getTracks().forEach((track) => track.stop());
+  }
+}
 
 export interface UseAudioRecorderOptions {
   onRecordingSaved?: (savedSentenceId: number, recording: StoredRecording) => void;
@@ -66,94 +108,42 @@ export function useAudioRecorder(
   sentenceId: number,
   options?: UseAudioRecorderOptions
 ): UseAudioRecorderReturn {
-  const initialCached = recordingStore.get(sentenceId);
-
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordingElapsedMs, setRecordingElapsedMs] = useState(0);
-  const [recordedDurationMs, setRecordedDurationMs] = useState(initialCached?.durationMs ?? 0);
-  const [audioBlob, setAudioBlob] = useState<Blob | null>(initialCached?.blob ?? null);
-  const [audioUrl, setAudioUrl] = useState<string | null>(initialCached?.url ?? null);
+  const [, setRenderTick] = useState(0);
   const [isPlayingVoice, setIsPlayingVoice] = useState(false);
-  const [micPermissionDenied, setMicPermissionDenied] = useState(false);
-  const [recordingError, setRecordingError] = useState<string | null>(null);
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const durationIntervalRef = useRef<number | null>(null);
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const startedAtRef = useRef<number>(0);
-
   const activeSentenceIdRef = useRef<number>(sentenceId);
   activeSentenceIdRef.current = sentenceId;
+  latestActiveSentenceId = sentenceId;
+  latestOnRecordingSaved = options?.onRecordingSaved;
 
-  const recordingTargetIdRef = useRef<number>(sentenceId);
-  const onRecordingSavedRef = useRef(options?.onRecordingSaved);
-  onRecordingSavedRef.current = options?.onRecordingSaved;
-
-  const pendingStopResolversRef = useRef<Array<(rec: StoredRecording | null) => void>>([]);
-
-  const isStartingRef = useRef<boolean>(false);
-
-  const stopDurationTicker = () => {
-    if (durationIntervalRef.current !== null) {
-      window.clearInterval(durationIntervalRef.current);
-      durationIntervalRef.current = null;
-    }
-  };
-
-  const releaseStream = (targetStream?: MediaStream | null) => {
-    const streamToStop = targetStream ?? streamRef.current;
-    if (streamToStop) {
-      streamToStop.getTracks().forEach((track) => track.stop());
-      if (!targetStream || streamRef.current === targetStream) {
-        streamRef.current = null;
-      }
-    }
-  };
-
-  // Switch sentence: finalize any active recording safely for its original sentenceId, then load target sentence cache
+  // Subscribe to global recording session updates so state stays synced across sentence/screen transitions
   useEffect(() => {
-    // Stop ongoing voice playback
+    const listener = () => {
+      setRenderTick((t) => t + 1);
+    };
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+    };
+  }, []);
+
+  // On sentence switch: stop only voice playback preview; NEVER stop an active microphone recording
+  useEffect(() => {
     if (audioElementRef.current) {
       audioElementRef.current.pause();
       audioElementRef.current = null;
       setIsPlayingVoice(false);
     }
-
-    const cached = recordingStore.get(sentenceId);
-    if (cached) {
-      setAudioBlob(cached.blob);
-      setAudioUrl(cached.url);
-      setRecordedDurationMs(cached.durationMs);
-    } else {
-      setAudioBlob(null);
-      setAudioUrl(null);
-      setRecordedDurationMs(0);
+    if (globalError !== null) {
+      globalError = null;
+      notifyListeners();
     }
-    setRecordingElapsedMs(0);
-    setRecordingError(null);
-
-    return () => {
-      // If user moves to another sentence or leaves Practice screen while actively recording,
-      // stop & flush the recording cleanly to its original target sentenceId so data isn't lost.
-      const recorder = mediaRecorderRef.current;
-      if (recorder && recorder.state === 'recording') {
-        stopDurationTicker();
-        try {
-          recorder.stop();
-        } catch {
-          releaseStream();
-        }
-        setIsRecording(false);
-      }
-    };
   }, [sentenceId]);
 
-  // Cleanup active playback/timers on unmount (do NOT revoke recordingStore URLs so recordings survive screen switches)
+  // On unmount: stop only voice playback preview (do NOT stop active recording or revoke stored URLs)
   useEffect(() => {
     return () => {
-      stopDurationTicker();
       if (audioElementRef.current) {
         audioElementRef.current.pause();
         audioElementRef.current = null;
@@ -163,14 +153,15 @@ export function useAudioRecorder(
 
   const startRecording = useCallback(async (): Promise<boolean> => {
     if (
-      isStartingRef.current ||
-      (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording')
+      isStartingRecording ||
+      (activeSession && activeSession.recorder.state === 'recording')
     ) {
       return false;
     }
 
-    isStartingRef.current = true;
-    setRecordingError(null);
+    isStartingRecording = true;
+    globalError = null;
+    notifyListeners();
     let localStream: MediaStream | null = null;
 
     try {
@@ -180,14 +171,14 @@ export function useAudioRecorder(
         typeof navigator.mediaDevices.getUserMedia !== 'function' ||
         typeof MediaRecorder === 'undefined'
       ) {
-        setMicPermissionDenied(true);
-        setRecordingError(
-          '이 브라우저는 오디오 녹음을 지원하지 않거나 보안 연결(HTTPS)이 필요합니다.'
-        );
+        globalMicDenied = true;
+        globalError =
+          '이 브라우저는 오디오 녹음을 지원하지 않거나 보안 연결(HTTPS)이 필요합니다.';
+        notifyListeners();
         return false;
       }
 
-      // Stop playback if playing
+      // Stop playback preview if currently playing
       if (audioElementRef.current) {
         audioElementRef.current.pause();
         audioElementRef.current = null;
@@ -202,10 +193,8 @@ export function useAudioRecorder(
         },
       });
 
-      streamRef.current = localStream;
-      setMicPermissionDenied(false);
+      globalMicDenied = false;
 
-      // Determine mimeType supported by browser
       let optionsObj: MediaRecorderOptions = {};
       if (typeof MediaRecorder.isTypeSupported === 'function') {
         if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
@@ -217,55 +206,65 @@ export function useAudioRecorder(
         }
       }
 
-      const targetSentenceId = activeSentenceIdRef.current;
-      recordingTargetIdRef.current = targetSentenceId;
-
       const recorder = new MediaRecorder(localStream, optionsObj);
-      mediaRecorderRef.current = recorder;
-      const chunks: Blob[] = [];
-      audioChunksRef.current = chunks;
       const recordingStartMs = Date.now();
-      startedAtRef.current = recordingStartMs;
+      const session: ActiveRecordingSession = {
+        recorder,
+        stream: localStream,
+        chunks: [],
+        startedAtMs: recordingStartMs,
+        tickerId: null,
+        saveSentenceId: null,
+        onStopResolvers: [],
+      };
+      activeSession = session;
 
       recorder.ondataavailable = (event) => {
         if (event.data && event.data.size > 0) {
-          chunks.push(event.data);
+          session.chunks.push(event.data);
         }
       };
 
       recorder.onerror = () => {
-        if (mediaRecorderRef.current === recorder) {
-          stopDurationTicker();
-          setIsRecording(false);
+        stopSessionTicker(session);
+        releaseSessionStream(session.stream);
+        if (activeSession === session) {
+          activeSession = null;
+          globalIsRecording = false;
+          globalElapsedMs = 0;
+          globalError =
+            '녹음 중 예기치 않은 오류가 발생했습니다. 기존 녹음 데이터는 유지됩니다.';
+          notifyListeners();
         }
-        releaseStream(localStream);
-        setRecordingError('녹음 중 예기치 않은 오류가 발생했습니다. 기존 녹음 데이터는 유지됩니다.');
-        const resolvers = pendingStopResolversRef.current.splice(0);
+        const resolvers = session.onStopResolvers.splice(0);
         resolvers.forEach((r) => r(null));
       };
 
       recorder.onstop = () => {
-        if (mediaRecorderRef.current === recorder) {
-          stopDurationTicker();
-          mediaRecorderRef.current = null;
-          setIsRecording(false);
-        }
-        releaseStream(localStream);
+        stopSessionTicker(session);
+        releaseSessionStream(session.stream);
 
-        const durationMs = Math.max(100, Date.now() - recordingStartMs);
+        if (activeSession === session) {
+          activeSession = null;
+          globalIsRecording = false;
+          globalElapsedMs = 0;
+        }
+
+        const durationMs = Math.max(100, Date.now() - session.startedAtMs);
         const mimeType = recorder.mimeType || 'audio/webm';
-        const blob = new Blob(chunks, { type: mimeType });
+        const blob = new Blob(session.chunks, { type: mimeType });
 
         // Guard against empty recording overwriting valid prior recording
         if (blob.size === 0) {
-          setRecordingError(
-            '녹음된 소리가 저장되지 않았습니다. 마이크 입력을 확인한 후 다시 시도해 주세요.'
-          );
-          const resolvers = pendingStopResolversRef.current.splice(0);
+          globalError =
+            '녹음된 소리가 저장되지 않았습니다. 마이크 입력을 확인한 후 다시 시도해 주세요.';
+          notifyListeners();
+          const resolvers = session.onStopResolvers.splice(0);
           resolvers.forEach((r) => r(null));
           return;
         }
 
+        const targetSentenceId = session.saveSentenceId ?? latestActiveSentenceId;
         const url = URL.createObjectURL(blob);
         const prev = recordingStore.get(targetSentenceId);
         if (prev) {
@@ -274,72 +273,92 @@ export function useAudioRecorder(
 
         const saved: StoredRecording = { blob, url, durationMs };
         recordingStore.set(targetSentenceId, saved);
+        notifyListeners();
 
-        if (activeSentenceIdRef.current === targetSentenceId) {
-          setAudioBlob(blob);
-          setAudioUrl(url);
-          setRecordedDurationMs(durationMs);
-        }
+        latestOnRecordingSaved?.(targetSentenceId, saved);
 
-        onRecordingSavedRef.current?.(targetSentenceId, saved);
-
-        const resolvers = pendingStopResolversRef.current.splice(0);
+        const resolvers = session.onStopResolvers.splice(0);
         resolvers.forEach((r) => r(saved));
       };
 
       recorder.start(100);
-      setIsRecording(true);
-      setRecordingElapsedMs(0);
+      globalIsRecording = true;
+      globalElapsedMs = 0;
 
-      stopDurationTicker();
-      durationIntervalRef.current = window.setInterval(() => {
-        setRecordingElapsedMs(Date.now() - recordingStartMs);
+      session.tickerId = window.setInterval(() => {
+        if (activeSession === session && globalIsRecording) {
+          globalElapsedMs = Date.now() - session.startedAtMs;
+          notifyListeners();
+        }
       }, 100);
 
+      notifyListeners();
       return true;
     } catch (err) {
       console.warn('Microphone access denied or error:', err);
-      releaseStream(localStream);
-      setIsRecording(false);
+      releaseSessionStream(localStream);
+      activeSession = null;
+      globalIsRecording = false;
+      globalElapsedMs = 0;
       const formatted = formatMicErrorMessage(err);
-      setMicPermissionDenied(formatted.denied);
-      setRecordingError(formatted.message);
+      globalMicDenied = formatted.denied;
+      globalError = formatted.message;
+      notifyListeners();
       return false;
     } finally {
-      isStartingRef.current = false;
+      isStartingRecording = false;
     }
   }, []);
 
+  // Manual Stop Recording: the ONLY place in the app that calls recorder.stop()
   const stopRecording = useCallback((): Promise<StoredRecording | null> => {
     return new Promise((resolve) => {
-      stopDurationTicker();
-      const recorder = mediaRecorderRef.current;
-
-      if (!recorder || recorder.state === 'inactive') {
-        releaseStream();
-        setIsRecording(false);
+      const session = activeSession;
+      if (!session || session.recorder.state === 'inactive') {
+        if (session) {
+          stopSessionTicker(session);
+          releaseSessionStream(session.stream);
+          activeSession = null;
+        }
+        globalIsRecording = false;
+        globalElapsedMs = 0;
+        notifyListeners();
         resolve(null);
         return;
       }
 
-      pendingStopResolversRef.current.push(resolve);
+      session.saveSentenceId = activeSentenceIdRef.current;
+      session.onStopResolvers.push(resolve);
+      stopSessionTicker(session);
 
       try {
-        recorder.stop();
+        session.recorder.stop();
       } catch (e) {
         console.error('Error stopping MediaRecorder:', e);
-        releaseStream();
-        setIsRecording(false);
-        setRecordingError('녹음을 종료하는 중 오류가 발생했습니다. 다시 시도해 주세요.');
-        const resolvers = pendingStopResolversRef.current.splice(0);
+        releaseSessionStream(session.stream);
+        activeSession = null;
+        globalIsRecording = false;
+        globalElapsedMs = 0;
+        globalError = '녹음을 종료하는 중 오류가 발생했습니다. 다시 시도해 주세요.';
+        notifyListeners();
+        const resolvers = session.onStopResolvers.splice(0);
         resolvers.forEach((r) => r(null));
       }
     });
   }, []);
 
+  const currentSaved = recordingStore.get(sentenceId);
+  const audioBlob = currentSaved?.blob ?? null;
+  const audioUrl = currentSaved?.url ?? null;
+  const recordedDurationMs = currentSaved?.durationMs ?? 0;
+
   const playRecordedVoice = useCallback(() => {
-    if (!audioUrl) return;
-    setRecordingError(null);
+    const saved = recordingStore.get(activeSentenceIdRef.current);
+    const targetUrl = saved?.url;
+    if (!targetUrl) return;
+
+    globalError = null;
+    notifyListeners();
 
     if (audioElementRef.current) {
       audioElementRef.current.pause();
@@ -348,7 +367,7 @@ export function useAudioRecorder(
       return;
     }
 
-    const audio = new Audio(audioUrl);
+    const audio = new Audio(targetUrl);
     audioElementRef.current = audio;
 
     audio.onended = () => {
@@ -359,7 +378,8 @@ export function useAudioRecorder(
     audio.onerror = () => {
       setIsPlayingVoice(false);
       audioElementRef.current = null;
-      setRecordingError('녹음된 오디오를 재생할 수 없습니다.');
+      globalError = '녹음된 오디오를 재생할 수 없습니다.';
+      notifyListeners();
     };
 
     setIsPlayingVoice(true);
@@ -367,9 +387,10 @@ export function useAudioRecorder(
       console.warn('Voice playback failed:', err);
       setIsPlayingVoice(false);
       audioElementRef.current = null;
-      setRecordingError('브라우저에서 오디오 재생이 차단되었거나 실패했습니다.');
+      globalError = '브라우저에서 오디오 재생이 차단되었거나 실패했습니다.';
+      notifyListeners();
     });
-  }, [audioUrl]);
+  }, []);
 
   const stopVoicePlayback = useCallback(() => {
     if (audioElementRef.current) {
@@ -385,28 +406,26 @@ export function useAudioRecorder(
     if (prev) {
       URL.revokeObjectURL(prev.url);
       recordingStore.delete(activeSentenceIdRef.current);
+      notifyListeners();
     }
-    setAudioBlob(null);
-    setAudioUrl(null);
-    setRecordedDurationMs(0);
-    setRecordingElapsedMs(0);
   }, [stopVoicePlayback]);
 
   const clearError = useCallback(() => {
-    setRecordingError(null);
+    globalError = null;
+    notifyListeners();
   }, []);
 
   return {
-    isRecording,
-    recordingDuration: Math.floor(recordingElapsedMs / 1000),
-    recordingElapsedMs,
+    isRecording: globalIsRecording,
+    recordingDuration: Math.floor(globalElapsedMs / 1000),
+    recordingElapsedMs: globalElapsedMs,
     recordedDurationMs,
     hasRecording: Boolean(audioUrl),
     audioBlob,
     audioUrl,
     isPlayingVoice,
-    micPermissionDenied,
-    recordingError,
+    micPermissionDenied: globalMicDenied,
+    recordingError: globalError,
     startRecording,
     stopRecording,
     playRecordedVoice,
