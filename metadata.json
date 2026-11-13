@@ -1,0 +1,6 @@
+{
+  "name": "Scene Shadow: Zootopia 2",
+  "description": "A movie-clip shadowing practice app for English learners based on Zootopia 2 scene, featuring sentence looping, synchronized voice recording, and speech evaluation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
