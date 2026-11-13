@@ -44,6 +44,30 @@ export default function App() {
     });
   };
 
+  const handleRecordSaved = (sentenceId: number, step: number) => {
+    setProgress((prev) => {
+      const existing: SentenceProgress = prev[sentenceId] || {
+        id: sentenceId,
+        plays: 0,
+        recordings: 0,
+        selfCheck: [null, null, null],
+        status: 'new',
+      };
+      const nextStatus: SentenceProgress['status'] =
+        step === 4 || existing.status === 'done' ? 'done' : 'practiced';
+      const next = {
+        ...prev,
+        [sentenceId]: {
+          ...existing,
+          recordings: existing.recordings + 1,
+          status: nextStatus,
+        },
+      };
+      saveStoredProgress(next);
+      return next;
+    });
+  };
+
   const handleSelectSentence = (idx: number) => {
     setCurrentIndex(idx);
     setScreen('practice');
@@ -167,6 +191,7 @@ export default function App() {
                 totalSentences={sentences.length}
                 progress={progress}
                 onUpdateProgress={handleUpdateProgress}
+                onRecordSaved={handleRecordSaved}
                 onPrevSentence={handlePrevSentence}
                 onNextSentence={handleNextSentence}
                 onJumpToSentenceIndex={(idx) => setCurrentIndex(idx)}

@@ -16,6 +16,8 @@ import {
   Sparkles,
   AudioLines,
   FastForward,
+  RotateCcw,
+  AlertCircle,
 } from 'lucide-react';
 import { Sentence, SentenceProgress, StepNumber, SelfCheckScore } from '../types';
 import { YouTubePlayer, YouTubePlayerRef } from '../components/YouTubePlayer';
@@ -31,12 +33,20 @@ interface PracticeScreenProps {
   totalSentences: number;
   progress: Record<number, SentenceProgress>;
   onUpdateProgress: (updated: SentenceProgress) => void;
+  onRecordSaved: (sentenceId: number, step: number) => void;
   onPrevSentence: () => void;
   onNextSentence: () => void;
   onJumpToSentenceIndex: (index: number) => void;
   onOpenList: () => void;
   onFinishApp: () => void;
   playerRef: React.RefObject<YouTubePlayerRef | null>;
+}
+
+function formatRecordingTimer(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
 export const PracticeScreen: React.FC<PracticeScreenProps> = ({
@@ -46,6 +56,7 @@ export const PracticeScreen: React.FC<PracticeScreenProps> = ({
   totalSentences,
   progress,
   onUpdateProgress,
+  onRecordSaved,
   onPrevSentence,
   onNextSentence,
   onJumpToSentenceIndex,
@@ -55,6 +66,9 @@ export const PracticeScreen: React.FC<PracticeScreenProps> = ({
 }) => {
   // Shadowing step: 1 (Listen), 2 (Mumble), 3 (Read & Shadow), 4 (Shadow)
   const [currentStep, setCurrentStep] = useState<StepNumber>(1);
+  const currentStepRef = useRef<StepNumber>(1);
+  currentStepRef.current = currentStep;
+
   const [hideText, setHideText] = useState(true);
   const [hideKorean, setHideKorean] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1.0);
@@ -64,18 +78,25 @@ export const PracticeScreen: React.FC<PracticeScreenProps> = ({
   const isPlayingSequenceRef = useRef(false);
   isPlayingSequenceRef.current = isPlayingSequence;
 
-  // Audio recording hook
+  // Audio recording hook (manual start/stop, safe across sentence/screen switches)
   const {
     isRecording,
-    recordingDuration,
+    recordingElapsedMs,
+    recordedDurationMs,
     hasRecording,
     isPlayingVoice,
     micPermissionDenied,
+    recordingError,
     startRecording,
     stopRecording,
     playRecordedVoice,
     stopVoicePlayback,
-  } = useAudioRecorder(sentence.id);
+    clearError,
+  } = useAudioRecorder(sentence.id, {
+    onRecordingSaved: (savedSentenceId) => {
+      onRecordSaved(savedSentenceId, currentStepRef.current);
+    },
+  });
 
   // Speech check hook (Web Speech API)
   const {
@@ -163,29 +184,13 @@ export const PracticeScreen: React.FC<PracticeScreenProps> = ({
     setIsPlayingSequence(false);
   };
 
-  // Handle when video reaches sentence.end
+  // Handle when video reaches sentence.end (never auto-stops recording)
   const loopTimerRef = useRef<number | null>(null);
-  const recordingStopTimerRef = useRef<number | null>(null);
 
   const handleSegmentEnd = () => {
     setIsPlayingSegment(false);
 
-    // If recording was active, stop recording 1 second after sentence ends (PRD section 5 item 7)
-    if (isRecording) {
-      recordingStopTimerRef.current = window.setTimeout(async () => {
-        await stopRecording();
-        // Update status and recordings count
-        const newStatus = currentStep === 4 ? 'done' : 'practiced';
-        onUpdateProgress({
-          ...currentProgress,
-          recordings: currentProgress.recordings + 1,
-          status: currentProgress.status === 'done' ? 'done' : newStatus,
-        });
-      }, 1000);
-      return;
-    }
-
-    // If loop is on (and not recording), wait 1.5 seconds then replay
+    // If loop is on, wait 1.5 seconds then replay
     if (isLooping) {
       loopTimerRef.current = window.setTimeout(() => {
         if (playerRef.current) {
@@ -200,30 +205,28 @@ export const PracticeScreen: React.FC<PracticeScreenProps> = ({
   useEffect(() => {
     return () => {
       if (loopTimerRef.current) clearTimeout(loopTimerRef.current);
-      if (recordingStopTimerRef.current) clearTimeout(recordingStopTimerRef.current);
     };
   }, []);
 
-  // Record Button: plays sentence once and records voice simultaneously
-  const handleStartRecordAndPlay = async () => {
-    setIsPlayingSequence(false);
-    if (isRecording) {
-      // Force manual stop
-      if (recordingStopTimerRef.current) clearTimeout(recordingStopTimerRef.current);
-      await stopRecording();
-      if (playerRef.current) playerRef.current.pause();
-      setIsPlayingSegment(false);
-      return;
-    }
+  // Warn before closing tab if actively recording
+  useEffect(() => {
+    if (!isRecording) return;
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [isRecording]);
 
-    const started = await startRecording();
-    if (!started) return;
+  // Manual Start Recording / Record Again
+  const handleManualStartRecording = async () => {
+    await startRecording();
+  };
 
-    // Start playing sentence once (loop is ignored while recording)
-    if (playerRef.current) {
-      setIsPlayingSegment(true);
-      playerRef.current.playSegment(sentence.start, sentence.end);
-    }
+  // Manual Stop Recording
+  const handleManualStopRecording = async () => {
+    await stopRecording();
   };
 
   // Self check rating handler
@@ -532,85 +535,168 @@ export const PracticeScreen: React.FC<PracticeScreenProps> = ({
         </div>
       </div>
 
-      {/* 7. Record Area: 🎙 Record, ▶ My Voice, ▶ Original */}
+      {/* 7. Record Area: Manual Start Recording, Stop Recording, Play Recording, Record Again */}
       <div className="px-3">
-        <div className="bg-gradient-to-b from-slate-900 to-slate-950 border border-slate-800 rounded-2xl p-4 shadow-md space-y-3">
-          <div className="flex items-center justify-between">
+        <div
+          className={`bg-gradient-to-b from-slate-900 to-slate-950 border rounded-2xl p-4 shadow-md space-y-3 transition-colors ${
+            isRecording ? 'border-rose-500/60 ring-1 ring-rose-500/30' : 'border-slate-800'
+          }`}
+        >
+          {/* Recording Header & Status */}
+          <div className="flex items-center justify-between gap-2">
             <h3 className="text-sm font-bold text-white flex items-center gap-1.5">
-              <Mic className="w-4 h-4 text-orange-400" />
+              <Mic className={`w-4 h-4 ${isRecording ? 'text-rose-400 animate-pulse' : 'text-orange-400'}`} />
               <span>Voice Shadowing & Review</span>
               <span className="text-xs font-normal text-slate-400">/ 녹음 및 비교</span>
             </h3>
-            {hasRecording && (
-              <span className="text-[11px] font-semibold text-teal-400 bg-teal-500/10 px-2 py-0.5 rounded-md border border-teal-500/20">
-                Recorded ✓
+
+            {isRecording ? (
+              <span
+                role="status"
+                aria-live="polite"
+                className="inline-flex items-center gap-1.5 text-xs font-bold text-rose-200 bg-rose-600/25 px-2.5 py-1 rounded-full border border-rose-500/50 font-mono"
+              >
+                <span className="w-2 h-2 rounded-full bg-rose-500 animate-ping" />
+                <span>REC {formatRecordingTimer(recordingElapsedMs)}</span>
               </span>
+            ) : hasRecording ? (
+              <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-teal-300 bg-teal-500/10 px-2.5 py-0.5 rounded-md border border-teal-500/25 font-mono">
+                <span>✓ 녹음 완료 · {(recordedDurationMs / 1000).toFixed(1)}s</span>
+              </span>
+            ) : (
+              <span className="text-[11px] text-slate-500">대기 중</span>
             )}
           </div>
 
-          {/* Record button (48px+ tall) */}
-          <button
-            type="button"
-            onClick={handleStartRecordAndPlay}
-            className={`w-full min-h-[52px] py-3.5 px-4 rounded-xl font-bold text-base flex items-center justify-center gap-3 transition-all cursor-pointer ${
-              isRecording
-                ? 'bg-rose-600 hover:bg-rose-500 text-white animate-pulse shadow-lg shadow-rose-900/50'
-                : 'bg-orange-600 hover:bg-orange-500 active:scale-[0.98] text-white shadow-lg shadow-orange-900/40 border border-orange-400/30'
-            }`}
-          >
-            {isRecording ? (
-              <>
-                <Square className="w-5 h-5 fill-current" />
-                <div className="text-left">
-                  <div className="leading-tight">Recording Voice... ({recordingDuration}s)</div>
-                  <div className="text-xs font-normal text-rose-100">동시 재생 중 · 끝난 후 1초 뒤 자동 중지</div>
-                </div>
-              </>
-            ) : (
-              <>
-                <Mic className="w-5 h-5" />
-                <div className="text-left">
-                  <div className="leading-tight">🎙 Record / 녹음하며 쉐도잉</div>
-                  <div className="text-xs font-normal text-orange-100">영상이 재생되며 내 목소리를 동시에 녹음합니다</div>
-                </div>
-              </>
-            )}
-          </button>
-
-          {/* Permission denied warning */}
-          {micPermissionDenied && (
-            <div className="p-3 bg-amber-500/15 border border-amber-500/30 rounded-xl text-xs text-amber-200">
-              <div className="font-bold flex items-center gap-1.5 mb-0.5">
-                <MicOff className="w-4 h-4 text-amber-400" />
-                <span>Mic is off. You can still listen and shadow out loud.</span>
+          {/* Active Recording Live Banner */}
+          {isRecording && (
+            <div className="p-2.5 rounded-xl bg-rose-950/50 border border-rose-500/35 flex items-center justify-between text-xs">
+              <div className="flex items-center gap-2 text-rose-200 font-semibold">
+                <span className="w-2.5 h-2.5 rounded-full bg-rose-500 animate-pulse shrink-0" />
+                <span>녹음 중... 원할 때 녹음 종료 버튼을 누르세요</span>
               </div>
-              <p className="text-amber-300/80">
-                마이크 권한이 꺼져 있습니다. 브라우저 설정에서 마이크를 켜거나 소리 내어 쉐도잉을 계속할 수 있습니다.
+              <span className="font-mono font-bold text-rose-300">
+                {(recordingElapsedMs / 1000).toFixed(1)}초
+              </span>
+            </div>
+          )}
+
+          {/* Manual Start Recording / Record Again & Stop Recording Controls */}
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              disabled={isRecording}
+              onClick={handleManualStartRecording}
+              className={`min-h-[52px] py-3 px-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all border ${
+                isRecording
+                  ? 'bg-slate-800/60 text-slate-500 border-slate-800 cursor-not-allowed opacity-50'
+                  : hasRecording
+                    ? 'bg-orange-600 hover:bg-orange-500 active:scale-[0.98] text-white border-orange-400/30 shadow-md shadow-orange-900/30 cursor-pointer'
+                    : 'bg-orange-600 hover:bg-orange-500 active:scale-[0.98] text-white border-orange-400/30 shadow-md shadow-orange-900/30 cursor-pointer'
+              }`}
+            >
+              {hasRecording && !isRecording ? (
+                <>
+                  <RotateCcw className="w-4 h-4 shrink-0" />
+                  <div className="text-left">
+                    <div className="leading-tight text-xs sm:text-sm">Record Again</div>
+                    <div className="text-[10px] font-normal text-orange-100">다시 녹음</div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <Mic className="w-4 h-4 shrink-0" />
+                  <div className="text-left">
+                    <div className="leading-tight text-xs sm:text-sm">Start Recording</div>
+                    <div className="text-[10px] font-normal text-orange-100/90">녹음 시작</div>
+                  </div>
+                </>
+              )}
+            </button>
+
+            <button
+              type="button"
+              disabled={!isRecording}
+              onClick={handleManualStopRecording}
+              className={`min-h-[52px] py-3 px-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all border ${
+                isRecording
+                  ? 'bg-rose-600 hover:bg-rose-500 active:scale-[0.98] text-white border-rose-400/40 shadow-lg shadow-rose-900/40 cursor-pointer'
+                  : 'bg-slate-800/60 text-slate-500 border-slate-800 cursor-not-allowed opacity-50'
+              }`}
+            >
+              <Square className="w-4 h-4 fill-current shrink-0" />
+              <div className="text-left">
+                <div className="leading-tight text-xs sm:text-sm">Stop Recording</div>
+                <div className="text-[10px] font-normal opacity-90">녹음 종료</div>
+              </div>
+            </button>
+          </div>
+
+          {/* Permission denied or recording error guidance */}
+          {micPermissionDenied && (
+            <div className="p-3 bg-amber-500/15 border border-amber-500/30 rounded-xl text-xs text-amber-200 space-y-1">
+              <div className="font-bold flex items-center gap-1.5">
+                <MicOff className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>마이크 권한이 필요합니다 (Mic permission required)</span>
+              </div>
+              <p className="text-amber-200/85 leading-relaxed">
+                브라우저 주소창의 자물쇠(🔒) 또는 사이트 설정에서 마이크 권한을 &lsquo;허용&rsquo;으로 변경한 뒤 다시 녹음 시작을 눌러주세요. 권한 없이도 영상 듣기와 따라 말하기는 계속 이용할 수 있습니다.
               </p>
             </div>
           )}
 
-          {/* Replay Buttons: My Voice & Original */}
-          <div className="grid grid-cols-2 gap-2 pt-1">
-            <button
-              type="button"
-              disabled={!hasRecording || isPlayingVoice}
-              onClick={playRecordedVoice}
-              className="min-h-[48px] py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-750 disabled:opacity-40 disabled:cursor-not-allowed text-slate-200 border border-slate-700 font-semibold text-xs flex items-center justify-center gap-2 transition-all cursor-pointer"
-            >
-              <Volume2 className={`w-4 h-4 text-teal-400 ${isPlayingVoice ? 'animate-bounce' : ''}`} />
-              <div className="text-left">
-                <div className="leading-tight">{isPlayingVoice ? 'Playing...' : '▶ My Voice'}</div>
-                <div className="text-[10px] text-slate-400">내 목소리 듣기</div>
+          {recordingError && !micPermissionDenied && (
+            <div className="p-3 bg-rose-500/15 border border-rose-500/30 rounded-xl text-xs text-rose-200 flex items-start justify-between gap-2">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <span className="leading-relaxed">{recordingError}</span>
               </div>
-            </button>
+              <button
+                type="button"
+                onClick={clearError}
+                className="text-[11px] text-rose-300 hover:text-white underline shrink-0 cursor-pointer"
+              >
+                닫기
+              </button>
+            </div>
+          )}
+
+          {/* Playback Controls: Show Play Recording after recording finishes + Original */}
+          <div className={`grid gap-2 pt-1 ${hasRecording && !isRecording ? 'grid-cols-2' : 'grid-cols-1'}`}>
+            {hasRecording && !isRecording && (
+              <button
+                type="button"
+                onClick={playRecordedVoice}
+                className={`min-h-[48px] py-2 px-3 rounded-xl border font-semibold text-xs flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                  isPlayingVoice
+                    ? 'bg-teal-600/25 text-teal-200 border-teal-400/50'
+                    : 'bg-teal-600 hover:bg-teal-500 text-white border-teal-400/30 shadow-md shadow-teal-900/30'
+                }`}
+              >
+                {isPlayingVoice ? (
+                  <Pause className="w-4 h-4 fill-current shrink-0" />
+                ) : (
+                  <Volume2 className="w-4 h-4 shrink-0" />
+                )}
+                <div className="text-left">
+                  <div className="leading-tight">
+                    {isPlayingVoice ? 'Stop Playback' : 'Play Recording'}
+                  </div>
+                  <div className="text-[10px] opacity-85">
+                    {isPlayingVoice
+                      ? '재생 중지'
+                      : `내 녹음 듣기 (${(recordedDurationMs / 1000).toFixed(1)}s)`}
+                  </div>
+                </div>
+              </button>
+            )}
 
             <button
               type="button"
               onClick={handlePlayOriginal}
               className="min-h-[48px] py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-750 text-slate-200 border border-slate-700 font-semibold text-xs flex items-center justify-center gap-2 transition-all cursor-pointer"
             >
-              <AudioLines className="w-4 h-4 text-orange-400" />
+              <AudioLines className="w-4 h-4 text-orange-400 shrink-0" />
               <div className="text-left">
                 <div className="leading-tight">▶ Original</div>
                 <div className="text-[10px] text-slate-400">원본 클립 듣기</div>
